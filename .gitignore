@@ -1,0 +1,7 @@
+logs/
+data/
+*.log
+*.core
+*.fasl
+*~
+.#*
