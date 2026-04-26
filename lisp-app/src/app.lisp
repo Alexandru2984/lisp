@@ -14,7 +14,7 @@
                 :car :cdr :cons :list :append :length
                 :mapcar :mapc :reduce :remove :remove-if :remove-if-not
                 :format :print :princ :prin1 :terpri
-                :defun :let :let* :if :cond :when :unless :case
+                :defun :let :let* :if :cond :when :unless :case :quote
                 :lambda :funcall :apply :progn :loop :dotimes :dolist
                 :t :nil
                 :string :string= :string-equal :concatenate
@@ -27,6 +27,27 @@
 (defvar *sandbox-package* (find-package :safe-sandbox))
 (defvar *custom-functions* (make-hash-table :test 'equal))
 
+;; --- SECURITY LAYER ---
+
+;; Validate that every symbol in the AST belongs strictly to the sandbox or keywords.
+;; This PREVENTS package-prefix attacks like (uiop:run-program "ls").
+(defun safe-symbol-p (sym)
+  (cond
+    ((null (symbol-package sym)) t) ; uninterned symbols
+    ((eq (symbol-package sym) (find-package :keyword)) t)
+    ((typep sym 'boolean) t)
+    (t (multiple-value-bind (found status) (find-symbol (symbol-name sym) *sandbox-package*)
+         (and found (eq found sym))))))
+
+;; AST Walker that deeply validates all forms before evaluation.
+(defun safe-form-p (form)
+  (cond
+    ((symbolp form) (safe-symbol-p form))
+    ((consp form)
+     (and (safe-form-p (car form))
+          (safe-form-p (cdr form))))
+    (t t))) ; strings, numbers are natively safe
+
 (defun save-functions ()
   (with-open-file (out *data-file*
                        :direction :output
@@ -37,9 +58,17 @@
       (format out "~S" data))))
 
 (defun safe-sandbox:redefine-function (name body &optional (skip-save nil))
-  (let ((*package* *sandbox-package*)
-        (*read-eval* nil))
-    (eval `(defun ,(intern (string-upcase name) *sandbox-package*) () ,body))
+  (let* ((*package* *sandbox-package*)
+         (*read-eval* nil)
+         (sym (intern (string-upcase name) *sandbox-package*)))
+    ;; 1. Prevent redefining core Common Lisp features
+    (when (eq (symbol-package sym) (find-package :cl))
+      (error "Security violation: Cannot redefine standard Common Lisp symbols!"))
+    ;; 2. Prevent malicious code injection inside the function
+    (unless (safe-form-p body)
+      (error "Security violation: Unauthorized external symbols in function body!"))
+      
+    (eval `(defun ,sym () ,body))
     (setf (gethash name *custom-functions*) body)
     (unless skip-save (save-functions))
     name))
@@ -50,7 +79,9 @@
       (let ((data (read in nil)))
         (dolist (item data)
           (destructuring-bind (name body) item
-            (safe-sandbox:redefine-function name body t)))))))
+            (handler-case
+                (safe-sandbox:redefine-function name body t)
+              (error (c) (format t "Failed to restore ~a: ~a~%" name c)))))))))
 
 (defun safe-sandbox:get-functions ()
   (let ((funcs nil))
@@ -60,19 +91,75 @@
     funcs))
 
 (defun safe-sandbox:safe-eval (expr)
+  ;; Ensure we parse the string securely without #. macro support
+  (unless (safe-form-p expr)
+    (error "Security violation: Unauthorized external symbols detected!"))
   (let ((*package* *sandbox-package*)
         (*read-eval* nil))
     (sb-ext:with-timeout *eval-timeout*
       (eval expr))))
 
+
+;; --- WEB SERVER LAYER ---
+
 (defvar *acceptor* nil)
 (defvar *port* 8093)
 
+;; HTML Form Auth Handlers
 (defun check-auth ()
-  (multiple-value-bind (user pass) (hunchentoot:authorization)
-    (unless (and (equal user *auth-user*) (equal pass *auth-pass*))
-      (hunchentoot:require-authorization "Lisp Sandbox"))))
+  (unless (hunchentoot:session-value 'authenticated)
+    (hunchentoot:redirect "/login")))
 
+(defun check-api-auth ()
+  (unless (hunchentoot:session-value 'authenticated)
+    (setf (hunchentoot:return-code*) 401)
+    (hunchentoot:abort-request-handler "Unauthorized")))
+
+(hunchentoot:define-easy-handler (login-page :uri "/login") (error)
+  (setf (hunchentoot:content-type*) "text/html")
+  (format nil "<!DOCTYPE html>
+<html lang='en' data-theme='dark'>
+<head>
+    <meta charset='UTF-8'>
+    <title>Login - Lisp Control Center</title>
+    <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css'>
+    <style>
+        body { display: flex; align-items: center; justify-content: center; height: 100vh; }
+        .login-card { padding: 2rem; width: 100%; max-width: 400px; border: 1px solid #333; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
+        .error { color: #ff6b6b; margin-bottom: 1rem; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class='login-card'>
+        <h2 style='text-align: center'>λ System Login</h2>
+        ~a
+        <form action='/do-login' method='POST'>
+            <label>Username
+                <input type='text' name='username' required>
+            </label>
+            <label>Password
+                <input type='password' name='password' required>
+            </label>
+            <button type='submit'>Authenticate</button>
+        </form>
+    </div>
+</body>
+</html>" (if error "<div class='error'>Invalid credentials!</div>" "")))
+
+(hunchentoot:define-easy-handler (do-login :uri "/do-login") (username password)
+  (if (and (equal username *auth-user*) (equal password *auth-pass*))
+      (progn
+        (hunchentoot:start-session)
+        (setf (hunchentoot:session-value 'authenticated) t)
+        (hunchentoot:redirect "/"))
+      (hunchentoot:redirect "/login?error=1")))
+
+(hunchentoot:define-easy-handler (do-logout :uri "/logout") ()
+  (hunchentoot:start-session)
+  (setf (hunchentoot:session-value 'authenticated) nil)
+  (hunchentoot:redirect "/login"))
+
+;; Main App UI
 (hunchentoot:define-easy-handler (home-page :uri "/") ()
   (check-auth)
   (setf (hunchentoot:content-type*) "text/html")
@@ -86,14 +173,18 @@
     <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/monokai.min.css'>
     <style>
         .CodeMirror { height: 150px; border-radius: 4px; margin-bottom: 1rem; border: 1px solid #333; }
-        pre#result { background: #1a1a1a; padding: 1rem; border-radius: 4px; min-height: 50px; border: 1px solid #333; white-space: pre-wrap; word-break: break-all; }
+        pre#result { background: #1a1a1a; padding: 1rem; border-radius: 4px; min-height: 50px; border: 1px solid #333; white-space: pre-wrap; word-break: break-all; color: #a6e22e; }
         .func-item { border-bottom: 1px solid #333; padding: 0.5rem 0; }
         .container { margin-top: 2rem; }
+        .nav-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #444; padding-bottom: 1rem; margin-bottom: 2rem; }
     </style>
 </head>
 <body>
     <main class='container'>
-        <h1>λ Lisp Self-Modifying Service</h1>
+        <div class='nav-header'>
+            <h1 style='margin:0'>λ Lisp Self-Modifying Service</h1>
+            <a href='/logout' role='button' class='secondary outline'>Logout</a>
+        </div>
         <div class='grid'>
             <section>
                 <h3>Safe REPL</h3>
@@ -120,14 +211,17 @@
     <script>
         const evalEditor = CodeMirror.fromTextArea(document.getElementById('eval-editor'), { mode: 'commonlisp', theme: 'monokai', lineNumbers: true });
         const funcEditor = CodeMirror.fromTextArea(document.getElementById('func-editor'), { mode: 'commonlisp', theme: 'monokai', lineNumbers: true });
+        
         async function doEval() {
             const res = await fetch('/api/eval', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body: new URLSearchParams({expr: evalEditor.getValue()})
             });
+            if (res.status === 401) { window.location.href = '/login'; return; }
             document.getElementById('result').innerText = await res.text();
         }
+        
         async function doRedefine() {
             const name = document.getElementById('func-name').value;
             if (!name) { alert('Name required!'); return; }
@@ -136,11 +230,14 @@
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body: new URLSearchParams({name: name, body: funcEditor.getValue()})
             });
+            if (res.status === 401) { window.location.href = '/login'; return; }
             alert(await res.text());
             loadFunctions();
         }
+        
         async function loadFunctions() {
             const res = await fetch('/api/functions');
+            if (res.status === 401) { window.location.href = '/login'; return; }
             const data = await res.json();
             const container = document.getElementById('functions-container');
             container.innerHTML = data.map(f => \"<div class='func-item'><strong>\"+f.name+\"</strong>: <code>\"+f.body+\"</code></div>\").join('') || 'No custom functions defined.';
@@ -150,21 +247,23 @@
 </body>
 </html>"))
 
+;; API Handlers
 (hunchentoot:define-easy-handler (api-eval :uri "/api/eval") (expr)
-  (check-auth)
+  (check-api-auth)
   (setf (hunchentoot:content-type*) "text/plain")
   (handler-case
       (let* ((*package* *sandbox-package*)
              (*read-eval* nil)
              (form (read-from-string expr))
              (result (safe-sandbox:safe-eval form)))
-        (with-open-file (log "/home/micu/lisp/lisp-app/logs/evaluations.log" :direction :output :if-exists :append :if-does-not-exist :create) (format log "[~a] EVAL: ~S => ~S~%" (get-universal-time) expr result))
+        (with-open-file (log "/home/micu/lisp/lisp-app/logs/evaluations.log" :direction :output :if-exists :append :if-does-not-exist :create) 
+          (format log "[~a] EVAL: ~S => ~S~%" (get-universal-time) expr result))
         (format nil "~S" result))
     (sb-ext:timeout () "Error: Evaluation timed out!")
     (error (c) (format nil "Error: ~a" c))))
 
 (hunchentoot:define-easy-handler (api-redefine :uri "/api/redefine") (name body)
-  (check-auth)
+  (check-api-auth)
   (setf (hunchentoot:content-type*) "text/plain")
   (handler-case
       (let* ((*package* *sandbox-package*)
@@ -175,12 +274,14 @@
     (error (c) (format nil "Error: ~a" c))))
 
 (hunchentoot:define-easy-handler (api-functions :uri "/api/functions") ()
-  (check-auth)
+  (check-api-auth)
   (setf (hunchentoot:content-type*) "application/json")
   (cl-json:encode-json-to-string (safe-sandbox:get-functions)))
 
+;; App Entry Point
 (defun start-server ()
   (safe-sandbox:restore-functions)
+  (setf hunchentoot:*session-secret* "random-production-secret-984")
   (setf *acceptor* (make-instance 'hunchentoot:easy-acceptor
                                   :port *port*
                                   :access-log-destination "/home/micu/lisp/lisp-app/logs/access.log"
