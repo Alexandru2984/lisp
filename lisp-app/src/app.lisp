@@ -18,7 +18,6 @@
                 :lambda :funcall :apply :progn :loop :dotimes :dolist
                 :t :nil
                 :string :string= :string-equal :concatenate
-                :make-array :aref
                 :arithmetic-error :type-error :error :condition)
   (:export :safe-eval :redefine-function :get-functions :restore-functions))
 
@@ -40,12 +39,13 @@
          (and found (eq found sym))))))
 
 ;; AST Walker that deeply validates all forms before evaluation.
-(defun safe-form-p (form)
+(defun safe-form-p (form &optional visited)
   (cond
+    ((member form visited) (error "Security violation: Circular structures not allowed!"))
     ((symbolp form) (safe-symbol-p form))
     ((consp form)
-     (and (safe-form-p (car form))
-          (safe-form-p (cdr form))))
+     (and (safe-form-p (car form) (cons form visited))
+          (safe-form-p (cdr form) (cons form visited))))
     (t t))) ; strings, numbers are natively safe
 
 (defun save-functions ()
@@ -235,12 +235,21 @@
             loadFunctions();
         }
         
+        function escapeHtml(unsafe) {
+            return unsafe
+                 .replace(/&/g, '&amp;')
+                 .replace(/</g, '&lt;')
+                 .replace(/>/g, '&gt;')
+                 .replace(/\"/g, '&quot;')
+                 .replace(/'/g, '&#039;');
+        }
+
         async function loadFunctions() {
             const res = await fetch('/api/functions');
             if (res.status === 401) { window.location.href = '/login'; return; }
             const data = await res.json();
             const container = document.getElementById('functions-container');
-            container.innerHTML = data.map(f => \"<div class='func-item'><strong>\"+f.name+\"</strong>: <code>\"+f.body+\"</code></div>\").join('') || 'No custom functions defined.';
+            container.innerHTML = data.map(f => \"<div class='func-item'><strong>\"+escapeHtml(f.name)+\"</strong>: <code>\"+escapeHtml(f.body)+\"</code></div>\").join('') || 'No custom functions defined.';
         }
         loadFunctions();
     </script>
