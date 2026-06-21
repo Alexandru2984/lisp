@@ -13,7 +13,7 @@
                 :sin :cos :tan :exp :log :sqrt
                 :car :cdr :cons :list :append :length
                 :mapcar :mapc :reduce :remove :remove-if :remove-if-not
-                :format :print :princ :prin1 :terpri
+                :print :princ :prin1 :terpri
                 :defun :let :let* :if :cond :when :unless :case :quote
                 :lambda :funcall :apply :progn :loop :dotimes :dolist
                 :t :nil
@@ -48,6 +48,59 @@
           (safe-form-p (cdr form) (cons form visited))))
     (t t))) ; strings, numbers are natively safe
 
+;; --- Safe FORMAT -------------------------------------------------------
+;; cl:format's ~/name/ directive calls an arbitrary function whose name comes
+;; from the *control string* (not from a symbol the AST walker can see), and
+;; ~? recursively formats with a control string taken from the arguments.
+;; Both bypass the symbol whitelist, so the sandbox exposes this wrapper
+;; instead of cl:format and refuses those two directives.
+(defun format-directive-chars (control)
+  "List the dispatch character of every ~ directive in CONTROL, skipping
+prefix parameters and the : @ modifiers."
+  (let ((chars '()) (i 0) (n (length control)))
+    (loop while (< i n) do
+      (cond
+        ((char= (char control i) #\~)
+         (incf i)
+         (loop while (< i n) do
+           (let ((c (char control i)))
+             (cond
+               ((char= c #\') (incf i 2))   ; 'x quoted-char parameter
+               ((or (digit-char-p c)
+                    (member c '(#\, #\: #\@ #\- #\+ #\# #\v #\V)))
+                (incf i))
+               (t (return)))))
+         (when (< i n)
+           (push (char-downcase (char control i)) chars)
+           (incf i)))
+        (t (incf i))))
+    (nreverse chars)))
+
+(defun format-control-safe-p (control)
+  (notany (lambda (d) (member d '(#\/ #\?))) (format-directive-chars control)))
+
+(defun safe-sandbox::format (destination control &rest args)
+  (unless (stringp control)
+    (error "Sandbox: format control must be a string."))
+  (unless (format-control-safe-p control)
+    (error "Security violation: format ~~/ and ~~? directives are not allowed."))
+  (apply #'cl:format destination control args))
+
+(defun truncate-output (string)
+  (if (> (length string) *max-output-bytes*)
+      (concatenate 'string (subseq string 0 *max-output-bytes*) " ...[truncated]")
+      string))
+
+(defun render-result (result)
+  "Print RESULT to a size-bounded string; guards against huge/deep/circular
+output that could exhaust memory while printing."
+  (let ((*print-circle* t)
+        (*print-length* 10000)
+        (*print-level* 100)
+        (*package* *sandbox-package*)
+        (*read-eval* nil))
+    (truncate-output (prin1-to-string result))))
+
 (defun save-functions ()
   (with-open-file (out *data-file*
                        :direction :output
@@ -58,16 +111,24 @@
       (format out "~S" data))))
 
 (defun safe-sandbox:redefine-function (name body &optional (skip-save nil))
+  ;; Cap the name length before interning so we cannot be made to intern a
+  ;; multi-megabyte symbol name.
+  (when (or (null name) (> (length name) *max-name-length*))
+    (error "Security violation: invalid or over-long function name!"))
   (let* ((*package* *sandbox-package*)
          (*read-eval* nil)
          (sym (intern (string-upcase name) *sandbox-package*)))
     ;; 1. Prevent redefining core Common Lisp features
     (when (eq (symbol-package sym) (find-package :cl))
       (error "Security violation: Cannot redefine standard Common Lisp symbols!"))
-    ;; 2. Prevent malicious code injection inside the function
+    ;; 2. Cap the number of stored functions (unbounded growth = DoS).
+    (when (and (null (nth-value 1 (gethash name *custom-functions*)))
+               (>= (hash-table-count *custom-functions*) *max-functions*))
+      (error "Limit reached: too many stored functions!"))
+    ;; 3. Prevent malicious code injection inside the function
     (unless (safe-form-p body)
       (error "Security violation: Unauthorized external symbols in function body!"))
-      
+
     (eval `(defun ,sym () ,body))
     (setf (gethash name *custom-functions*) body)
     (unless skip-save (save-functions))
@@ -76,7 +137,9 @@
 (defun safe-sandbox:restore-functions ()
   (when (probe-file *data-file*)
     (with-open-file (in *data-file*)
-      (let ((data (read in nil)))
+      ;; Never honour #. (read-eval) when loading persisted data.
+      (let* ((*read-eval* nil)
+             (data (read in nil)))
         (dolist (item data)
           (destructuring-bind (name body) item
             (handler-case
@@ -294,26 +357,37 @@
   (check-api-auth)
   (setf (hunchentoot:content-type*) "text/plain")
   (handler-case
-      (let* ((*package* *sandbox-package*)
-             (*read-eval* nil)
-             (form (read-from-string expr))
-             (result (safe-sandbox:safe-eval form)))
-        (with-open-file (log "/home/micu/lisp/lisp-app/logs/evaluations.log" :direction :output :if-exists :append :if-does-not-exist :create) 
-          (format log "[~a] EVAL: ~S => ~S~%" (get-universal-time) expr result))
-        (format nil "~S" result))
+      (progn
+        (when (or (null expr) (> (length expr) *max-input-bytes*))
+          (error "Input exceeds the ~a byte limit." *max-input-bytes*))
+        (let* ((*package* *sandbox-package*)
+               (*read-eval* nil)
+               (form (read-from-string expr))
+               (result (safe-sandbox:safe-eval form))
+               (out (render-result result)))
+          (with-open-file (log "/home/micu/lisp/lisp-app/logs/evaluations.log" :direction :output :if-exists :append :if-does-not-exist :create)
+            (format log "[~a] EVAL: ~S => ~a~%" (get-universal-time) expr out))
+          out))
     (sb-ext:timeout () "Error: Evaluation timed out!")
-    (error (c) (format nil "Error: ~a" c))))
+    (storage-condition () "Error: Resource limit exceeded!")
+    (serious-condition (c) (format nil "Error: ~a" c))))
 
 (hunchentoot:define-easy-handler (api-redefine :uri "/api/redefine") (name body)
   (check-api-auth)
   (setf (hunchentoot:content-type*) "text/plain")
   (handler-case
-      (let* ((*package* *sandbox-package*)
-             (*read-eval* nil)
-             (body-form (read-from-string body)))
-        (safe-sandbox:redefine-function name body-form)
-        (format nil "Function '~a' defined successfully." name))
-    (error (c) (format nil "Error: ~a" c))))
+      (progn
+        (when (or (null name) (null body)
+                  (> (length name) *max-name-length*)
+                  (> (length body) *max-input-bytes*))
+          (error "Invalid or oversized input."))
+        (let* ((*package* *sandbox-package*)
+               (*read-eval* nil)
+               (body-form (read-from-string body)))
+          (safe-sandbox:redefine-function name body-form)
+          (format nil "Function '~a' defined successfully." name)))
+    (storage-condition () "Error: Resource limit exceeded!")
+    (serious-condition (c) (format nil "Error: ~a" c))))
 
 (hunchentoot:define-easy-handler (api-functions :uri "/api/functions") ()
   (check-api-auth)
