@@ -3,7 +3,9 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (ql:quickload '(:hunchentoot :alexandria :cl-json)))
 
-(load "/home/micu/lisp/lisp-app/config/config.lisp")
+;; Load config relative to this file so the project is portable (CI, clones).
+(load (merge-pathnames "../config/config.lisp"
+                       (or *load-pathname* *default-pathname-defaults*)))
 
 (defpackage :safe-sandbox
   (:use)

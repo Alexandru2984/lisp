@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  sandbox-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SBCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sbcl
+
+      - name: Install Quicklisp
+        run: |
+          curl -sSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp
+          sbcl --non-interactive \
+               --load /tmp/quicklisp.lisp \
+               --eval '(quicklisp-quickstart:install)' \
+               --quit
+
+      - name: Run sandbox regression tests
+        env:
+          LISP_APP_NO_AUTOSTART: "1"
+          LISP_AUTH_USER: ci
+          LISP_AUTH_PASS: ci-test-password
+          LISP_SESSION_SECRET: 0123456789abcdef0123456789abcdef0123
+          LISP_DATA_FILE: /tmp/functions.lisp
+          LISP_LOG_DIR: /tmp
+        run: |
+          sbcl --non-interactive \
+               --load "$HOME/quicklisp/setup.lisp" \
+               --load tests/sandbox-tests.lisp
