@@ -105,6 +105,19 @@
 (defvar *acceptor* nil)
 (defvar *port* 8093)
 
+;; Compare two strings without an early-exit so the time taken does not
+;; reveal how many leading characters matched (mitigates timing oracles
+;; against the credentials).
+(defun constant-time-equal (a b)
+  (let* ((a (string (or a ""))) (b (string (or b "")))
+         (la (length a)) (lb (length b))
+         (acc (logxor la lb)))
+    (dotimes (i (max la lb))
+      (setf acc (logior acc
+                        (logxor (if (< i la) (char-code (char a i)) 0)
+                                (if (< i lb) (char-code (char b i)) 0)))))
+    (zerop acc)))
+
 ;; HTML Form Auth Handlers
 (defun check-auth ()
   (unless (hunchentoot:session-value 'authenticated)
@@ -121,6 +134,7 @@
 <html lang='en' data-theme='dark'>
 <head>
     <meta charset='UTF-8'>
+    <meta name='robots' content='noindex, nofollow'>
     <title>Login - Lisp Control Center</title>
     <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css'>
     <style>
@@ -147,12 +161,16 @@
 </html>" (if error "<div class='error'>Invalid credentials!</div>" "")))
 
 (hunchentoot:define-easy-handler (do-login :uri "/do-login") (username password)
-  (if (and (equal username *auth-user*) (equal password *auth-pass*))
-      (progn
-        (hunchentoot:start-session)
-        (setf (hunchentoot:session-value 'authenticated) t)
-        (hunchentoot:redirect "/"))
-      (hunchentoot:redirect "/login?error=1")))
+  ;; Evaluate both checks unconditionally so a wrong username and a wrong
+  ;; password are indistinguishable by timing.
+  (let ((user-ok (constant-time-equal username *auth-user*))
+        (pass-ok (constant-time-equal password *auth-pass*)))
+    (if (and user-ok pass-ok)
+        (progn
+          (hunchentoot:start-session)
+          (setf (hunchentoot:session-value 'authenticated) t)
+          (hunchentoot:redirect "/"))
+        (hunchentoot:redirect "/login?error=1"))))
 
 (hunchentoot:define-easy-handler (do-logout :uri "/logout") ()
   (hunchentoot:start-session)
@@ -290,13 +308,19 @@
 ;; App Entry Point
 (defun start-server ()
   (safe-sandbox:restore-functions)
-  (setf hunchentoot:*session-secret* "random-production-secret-984")
+  (setf hunchentoot:*session-secret* *session-secret*)
   (setf *acceptor* (make-instance 'hunchentoot:easy-acceptor
                                   :port *port*
                                   :access-log-destination "/home/micu/lisp/lisp-app/logs/access.log"
                                   :message-log-destination "/home/micu/lisp/lisp-app/logs/message.log"))
   (hunchentoot:start *acceptor*)
-  (format t "Server started on port ~a~%" *port*))
+  (format t "Server started on ~a:~a~%" *bind-address* *port*))
 
-(start-server)
-(loop (sleep 3600))
+(defun main ()
+  (start-server)
+  (loop (sleep 3600)))
+
+;; Loading the file for tests/inspection must not start the listener.
+;; Set LISP_APP_NO_AUTOSTART=1 to load definitions only.
+(unless (config-env "LISP_APP_NO_AUTOSTART")
+  (main))

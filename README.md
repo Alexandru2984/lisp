@@ -1,9 +1,10 @@
 # 🚀 Self-Modifying Common Lisp Web Service
 
-## 🔐 Acces rapid
+## 🔐 Acces
 - **URL:** [https://lisp.micutu.com](https://lisp.micutu.com)
-- **Utilizator:** `admin`
-- **Parolă:** `admin`
+- Credențialele NU sunt stocate în cod sau în README. Se configurează prin
+  variabile de mediu (vezi `deploy/lisp-app.env.example`). Serviciul refuză
+  să pornească dacă secretele lipsesc.
 
 ---
 
