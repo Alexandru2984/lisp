@@ -118,10 +118,21 @@
                                 (if (< i lb) (char-code (char b i)) 0)))))
     (zerop acc)))
 
+;; Hunchentoot only marks the session cookie HttpOnly by default. Re-emit it
+;; with Secure (HTTPS-only) and SameSite=Strict (blocks cross-site sends, a
+;; baseline CSRF defence) once the user is authenticated.
+(defun harden-session-cookie (session)
+  (hunchentoot:set-cookie (hunchentoot:session-cookie-name hunchentoot:*acceptor*)
+                          :value (hunchentoot:session-cookie-value session)
+                          :path "/"
+                          :http-only t
+                          :secure t
+                          :same-site "Strict"))
+
 ;; HTML Form Auth Handlers
 (defun check-auth ()
   (unless (hunchentoot:session-value 'authenticated)
-    (hunchentoot:redirect "/login")))
+    (hunchentoot:redirect "/login" :add-session-id nil)))
 
 (defun check-api-auth ()
   (unless (hunchentoot:session-value 'authenticated)
@@ -166,16 +177,20 @@
   (let ((user-ok (constant-time-equal username *auth-user*))
         (pass-ok (constant-time-equal password *auth-pass*)))
     (if (and user-ok pass-ok)
-        (progn
-          (hunchentoot:start-session)
+        (let ((session (hunchentoot:start-session)))
+          ;; Rotate the session id on login to defeat session fixation.
+          (hunchentoot:regenerate-session-cookie-value session)
           (setf (hunchentoot:session-value 'authenticated) t)
-          (hunchentoot:redirect "/"))
-        (hunchentoot:redirect "/login?error=1"))))
+          (harden-session-cookie session)
+          (hunchentoot:redirect "/" :add-session-id nil))
+        (hunchentoot:redirect "/login?error=1" :add-session-id nil))))
 
 (hunchentoot:define-easy-handler (do-logout :uri "/logout") ()
-  (hunchentoot:start-session)
-  (setf (hunchentoot:session-value 'authenticated) nil)
-  (hunchentoot:redirect "/login"))
+  ;; Fully invalidate the session server-side, not just the flag.
+  (let ((session (hunchentoot:session hunchentoot:*request*)))
+    (when session
+      (hunchentoot:remove-session session)))
+  (hunchentoot:redirect "/login" :add-session-id nil))
 
 ;; Main App UI
 (hunchentoot:define-easy-handler (home-page :uri "/") ()
@@ -309,7 +324,10 @@
 (defun start-server ()
   (safe-sandbox:restore-functions)
   (setf hunchentoot:*session-secret* *session-secret*)
+  ;; Never put the session id in URLs (it would leak via Referer/logs/history).
+  (setf hunchentoot:*rewrite-for-session-urls* nil)
   (setf *acceptor* (make-instance 'hunchentoot:easy-acceptor
+                                  :address *bind-address*
                                   :port *port*
                                   :access-log-destination "/home/micu/lisp/lisp-app/logs/access.log"
                                   :message-log-destination "/home/micu/lisp/lisp-app/logs/message.log"))
