@@ -1,14 +1,58 @@
 [Unit]
-Description=Common Lisp Web Service
+Description=Lisp Control Center (sandboxed Common Lisp REPL service)
 After=network.target
 
 [Service]
 Type=simple
 User=micu
-WorkingDirectory=/home/micu/commonLisp/lisp-app
-ExecStart=/usr/bin/sbcl --non-interactive --load /home/micu/commonLisp/lisp-app/src/app.lisp
+WorkingDirectory=/home/micu/lisp/lisp-app
+
+# Secrets live here, outside the repo, root-owned 0600. The service refuses
+# to start if the required variables are missing (see config.lisp).
+EnvironmentFile=/etc/lisp-app/lisp-app.env
+
+# Cap the Lisp heap below MemoryMax so an allocation bomb hits a catchable
+# Lisp storage-condition instead of being OOM-killed by the cgroup.
+ExecStart=/usr/bin/sbcl --dynamic-space-size 256 --non-interactive --load /home/micu/lisp/lisp-app/src/app.lisp
+
+# A heap-allocation bomb (only triggerable by an authenticated admin) makes
+# SBCL exit when it hits --dynamic-space-size; always restart fast so the
+# outage is a brief, self-healing blip. Start-rate limiting is disabled so the
+# service can never get stuck in the failed state.
 Restart=always
-RestartSec=3
+RestartSec=2
+StartLimitIntervalSec=0
+
+# --- Sandboxing / least privilege -------------------------------------
+NoNewPrivileges=yes
+# Whole filesystem read-only except the two dirs the app actually writes.
+ProtectSystem=strict
+ReadWritePaths=/home/micu/lisp/lisp-app/logs /home/micu/lisp/lisp-app/data
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# NB: MemoryDenyWriteExecute is intentionally NOT set: SBCL JIT-compiles and
+# needs writable+executable memory.
+UMask=077
+
+# --- Resource limits --------------------------------------------------
+MemoryMax=512M
+CPUQuota=75%
+TasksMax=100
 
 [Install]
 WantedBy=multi-user.target
