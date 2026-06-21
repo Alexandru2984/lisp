@@ -192,6 +192,104 @@ output that could exhaust memory while printing."
                           :secure t
                           :same-site "Strict"))
 
+;; --- DEFENSE-IN-DEPTH LAYER --------------------------------------------
+
+;; Cryptographically strong random hex token (CSPRNG via /dev/urandom),
+;; used for CSP nonces and CSRF tokens. cl:random is NOT suitable here.
+(defun random-token (&optional (bytes 16))
+  (with-open-file (u "/dev/urandom" :element-type '(unsigned-byte 8))
+    (let ((buf (make-array bytes :element-type '(unsigned-byte 8))))
+      (read-sequence buf u)
+      (with-output-to-string (s)
+        (loop for b across buf do (cl:format s "~(~2,'0x~)" b))))))
+
+;; --- Logging (sanitized, ISO 8601, never breaks a request) ---
+(defun iso-timestamp (&optional (ut (get-universal-time)))
+  (multiple-value-bind (s m h d mon y) (decode-universal-time ut 0)
+    (cl:format nil "~4,'0d-~2,'0d-~2,'0dT~2,'0d:~2,'0d:~2,'0dZ" y mon d h m s)))
+
+(defun sanitize-log (value &optional (max 500))
+  "Drop control characters (prevents log injection) and bound the length."
+  (let ((s (remove-if (lambda (c) (< (char-code c) 32)) (string value))))
+    (if (> (length s) max) (subseq s 0 max) s)))
+
+(defun log-path (name)
+  (concatenate 'string (string-right-trim "/" *log-dir*) "/" name))
+
+(defun log-event (filename fmt &rest args)
+  (handler-case
+      (with-open-file (log (log-path filename)
+                           :direction :output :if-exists :append :if-does-not-exist :create)
+        (cl:format log "[~a] ~a~%" (iso-timestamp) (apply #'cl:format nil fmt args)))
+    (error () nil)))
+
+;; --- Real client IP (behind Cloudflare + Nginx) ---
+(defun client-ip ()
+  (or (hunchentoot:header-in* :cf-connecting-ip)
+      (hunchentoot:header-in* :x-real-ip)
+      (ignore-errors (hunchentoot:real-remote-addr))
+      "unknown"))
+
+;; --- Per-IP login throttling (thread-safe) ---
+(defvar *login-attempts* (make-hash-table :test 'equal))
+(defvar *login-lock* (sb-thread:make-mutex :name "login-attempts"))
+
+(defun login-locked-p (ip)
+  (sb-thread:with-mutex (*login-lock*)
+    (let ((entry (gethash ip *login-attempts*)))
+      (and entry
+           (>= (car entry) *login-max-attempts*)
+           (< (get-universal-time) (cdr entry))))))
+
+(defun register-login-failure (ip)
+  (sb-thread:with-mutex (*login-lock*)
+    (let* ((now (get-universal-time))
+           (entry (gethash ip *login-attempts*))
+           (count (if (and entry (< now (cdr entry))) (1+ (car entry)) 1)))
+      (setf (gethash ip *login-attempts*) (cons count (+ now *login-lockout-secs*))))))
+
+(defun clear-login-failures (ip)
+  (sb-thread:with-mutex (*login-lock*)
+    (remhash ip *login-attempts*)))
+
+;; --- CSRF tokens (synchronizer pattern; SameSite=Strict is the first line) ---
+(defun ensure-csrf-token ()
+  (or (hunchentoot:session-value 'csrf-token)
+      (setf (hunchentoot:session-value 'csrf-token) (random-token 32))))
+
+(defun check-csrf ()
+  (let ((sent (hunchentoot:header-in* :x-csrf-token))
+        (expected (hunchentoot:session-value 'csrf-token)))
+    (unless (and expected sent (constant-time-equal sent expected))
+      (setf (hunchentoot:return-code*) 403)
+      (hunchentoot:abort-request-handler "CSRF token invalid"))))
+
+;; --- Security headers on every response (set before the handler runs) ---
+(defvar *csp-nonce* nil)
+
+(defun set-security-headers (nonce)
+  (flet ((h (name val) (setf (hunchentoot:header-out name) val)))
+    (h :x-content-type-options "nosniff")
+    (h :x-frame-options "DENY")
+    (h :referrer-policy "no-referrer")
+    (h :permissions-policy "geolocation=(), microphone=(), camera=()")
+    (h :strict-transport-security "max-age=63072000; includeSubDomains")
+    (h :content-security-policy
+       (cl:format nil "default-src 'none'; ~
+                       script-src 'nonce-~a' https://cdnjs.cloudflare.com; ~
+                       style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; ~
+                       font-src 'self'; img-src 'self' data:; connect-src 'self'; ~
+                       base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+                  nonce))))
+
+(defclass lisp-acceptor (hunchentoot:easy-acceptor) ())
+
+(defmethod hunchentoot:acceptor-dispatch-request :around ((acceptor lisp-acceptor) request)
+  (declare (ignore request))
+  (let ((*csp-nonce* (random-token 16)))
+    (set-security-headers *csp-nonce*)
+    (call-next-method)))
+
 ;; HTML Form Auth Handlers
 (defun check-auth ()
   (unless (hunchentoot:session-value 'authenticated)
@@ -210,7 +308,7 @@ output that could exhaust memory while printing."
     <meta charset='UTF-8'>
     <meta name='robots' content='noindex, nofollow'>
     <title>Login - Lisp Control Center</title>
-    <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css'>
+    <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/@picocss/pico@1.5.13/css/pico.min.css' integrity='sha384-Igjx5rLo1oJuDlq1Ls6uECey1nXahm4j4GoF8ixTon9zxdse6QkdsFelFYk8j7rI' crossorigin='anonymous'>
     <style>
         body { display: flex; align-items: center; justify-content: center; height: 100vh; }
         .login-card { padding: 2rem; width: 100%; max-width: 400px; border: 1px solid #333; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.5); }
@@ -235,18 +333,35 @@ output that could exhaust memory while printing."
 </html>" (if error "<div class='error'>Invalid credentials!</div>" "")))
 
 (hunchentoot:define-easy-handler (do-login :uri "/do-login") (username password)
-  ;; Evaluate both checks unconditionally so a wrong username and a wrong
-  ;; password are indistinguishable by timing.
-  (let ((user-ok (constant-time-equal username *auth-user*))
-        (pass-ok (constant-time-equal password *auth-pass*)))
-    (if (and user-ok pass-ok)
-        (let ((session (hunchentoot:start-session)))
-          ;; Rotate the session id on login to defeat session fixation.
-          (hunchentoot:regenerate-session-cookie-value session)
-          (setf (hunchentoot:session-value 'authenticated) t)
-          (harden-session-cookie session)
-          (hunchentoot:redirect "/" :add-session-id nil))
-        (hunchentoot:redirect "/login?error=1" :add-session-id nil))))
+  (let ((ip (client-ip)))
+    (cond
+      ;; Throttle brute-force attempts per IP.
+      ((login-locked-p ip)
+       (log-event "security.log" "LOGIN locked-out ip=~a" (sanitize-log ip))
+       (setf (hunchentoot:return-code*) 429
+             (hunchentoot:content-type*) "text/plain")
+       "Too many failed attempts. Please try again later.")
+      (t
+       ;; Evaluate both checks unconditionally so a wrong username and a wrong
+       ;; password are indistinguishable by timing.
+       (let ((user-ok (constant-time-equal username *auth-user*))
+             (pass-ok (constant-time-equal password *auth-pass*)))
+         (cond
+           ((and user-ok pass-ok)
+            (clear-login-failures ip)
+            (let ((session (hunchentoot:start-session)))
+              ;; Rotate the session id on login to defeat session fixation.
+              (hunchentoot:regenerate-session-cookie-value session)
+              (setf (hunchentoot:session-value 'authenticated) t)
+              (ensure-csrf-token)
+              (harden-session-cookie session)
+              (log-event "security.log" "LOGIN success ip=~a" (sanitize-log ip))
+              (hunchentoot:redirect "/" :add-session-id nil)))
+           (t
+            (register-login-failure ip)
+            (log-event "security.log" "LOGIN failure ip=~a user=~a"
+                       (sanitize-log ip) (sanitize-log (or username "")))
+            (hunchentoot:redirect "/login?error=1" :add-session-id nil))))))))
 
 (hunchentoot:define-easy-handler (do-logout :uri "/logout") ()
   ;; Fully invalidate the session server-side, not just the flag.
@@ -264,9 +379,9 @@ output that could exhaust memory while printing."
 <head>
     <meta charset='UTF-8'>
     <title>Lisp Control Center</title>
-    <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css'>
-    <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css'>
-    <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/monokai.min.css'>
+    <link rel='stylesheet' href='https://cdn.jsdelivr.net/npm/@picocss/pico@1.5.13/css/pico.min.css' integrity='sha384-Igjx5rLo1oJuDlq1Ls6uECey1nXahm4j4GoF8ixTon9zxdse6QkdsFelFYk8j7rI' crossorigin='anonymous'>
+    <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css' integrity='sha384-zaeBlB/vwYsDRSlFajnDd7OydJ0cWk+c2OWybl3eSUf6hW2EbhlCsQPqKr3gkznT' crossorigin='anonymous'>
+    <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/theme/monokai.min.css' integrity='sha384-05WuhgjXiqmZzcQ3vQRQ39HN356Yqb+SnhvELzFtpwS5b2IlqE8QsOO5LCSJ2znj' crossorigin='anonymous'>
     <style>
         .CodeMirror { height: 150px; border-radius: 4px; margin-bottom: 1rem; border: 1px solid #333; }
         pre#result { background: #1a1a1a; padding: 1rem; border-radius: 4px; min-height: 50px; border: 1px solid #333; white-space: pre-wrap; word-break: break-all; color: #a6e22e; }
@@ -285,7 +400,7 @@ output that could exhaust memory while printing."
             <section>
                 <h3>Safe REPL</h3>
                 <textarea id='eval-editor'>(+ 1 2 3)</textarea>
-                <button onclick='doEval()'>Run Expression</button>
+                <button id='run-btn'>Run Expression</button>
                 <label>Output:</label>
                 <pre id='result'>Ready.</pre>
             </section>
@@ -293,7 +408,7 @@ output that could exhaust memory while printing."
                 <h3>Redefine Function</h3>
                 <input type='text' id='func-name' placeholder='function-name'>
                 <textarea id='func-editor'>(format nil \"Hello from ~~a\" \"Lisp\")</textarea>
-                <button class='secondary' onclick='doRedefine()'>Save & Define</button>
+                <button class='secondary' id='define-btn'>Save & Define</button>
             </section>
         </div>
         <hr>
@@ -302,35 +417,39 @@ output that could exhaust memory while printing."
             <div id='functions-container'>Loading...</div>
         </section>
     </main>
-    <script src='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js'></script>
-    <script src='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/commonlisp/commonlisp.min.js'></script>
-    <script>
+    <script src='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js' integrity='sha384-oG4CsOtmTEhYO9bKzsYPGRJyqcREeEElY9hokeI8NndemZlK5k6d+0LX0xY5HObE' crossorigin='anonymous'></script>
+    <script src='https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/commonlisp/commonlisp.min.js' integrity='sha384-ye4RbMVxAnFR5m3bDEHC/aMjpHeLXp0sfDBS/nlkE/GnpnAngBz7b5ufKgCuadrF' crossorigin='anonymous'></script>
+    <script nonce='~a'>
+        const CSRF = '~a';
         const evalEditor = CodeMirror.fromTextArea(document.getElementById('eval-editor'), { mode: 'commonlisp', theme: 'monokai', lineNumbers: true });
         const funcEditor = CodeMirror.fromTextArea(document.getElementById('func-editor'), { mode: 'commonlisp', theme: 'monokai', lineNumbers: true });
-        
+
         async function doEval() {
             const res = await fetch('/api/eval', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRF-Token': CSRF },
                 body: new URLSearchParams({expr: evalEditor.getValue()})
             });
             if (res.status === 401) { window.location.href = '/login'; return; }
             document.getElementById('result').innerText = await res.text();
         }
-        
+
         async function doRedefine() {
             const name = document.getElementById('func-name').value;
             if (!name) { alert('Name required!'); return; }
             const res = await fetch('/api/redefine', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-CSRF-Token': CSRF },
                 body: new URLSearchParams({name: name, body: funcEditor.getValue()})
             });
             if (res.status === 401) { window.location.href = '/login'; return; }
             alert(await res.text());
             loadFunctions();
         }
-        
+
+        document.getElementById('run-btn').addEventListener('click', doEval);
+        document.getElementById('define-btn').addEventListener('click', doRedefine);
+
         function escapeHtml(unsafe) {
             return unsafe
                  .replace(/&/g, '&amp;')
@@ -350,11 +469,12 @@ output that could exhaust memory while printing."
         loadFunctions();
     </script>
 </body>
-</html>"))
+</html>" *csp-nonce* (ensure-csrf-token)))
 
 ;; API Handlers
 (hunchentoot:define-easy-handler (api-eval :uri "/api/eval") (expr)
   (check-api-auth)
+  (check-csrf)
   (setf (hunchentoot:content-type*) "text/plain")
   (handler-case
       (progn
@@ -365,8 +485,8 @@ output that could exhaust memory while printing."
                (form (read-from-string expr))
                (result (safe-sandbox:safe-eval form))
                (out (render-result result)))
-          (with-open-file (log "/home/micu/lisp/lisp-app/logs/evaluations.log" :direction :output :if-exists :append :if-does-not-exist :create)
-            (format log "[~a] EVAL: ~S => ~a~%" (get-universal-time) expr out))
+          (log-event "evaluations.log" "EVAL ip=~a expr=~s => ~a"
+                     (sanitize-log (client-ip) 64) (sanitize-log expr) (sanitize-log out))
           out))
     (sb-ext:timeout () "Error: Evaluation timed out!")
     (storage-condition () "Error: Resource limit exceeded!")
@@ -374,6 +494,7 @@ output that could exhaust memory while printing."
 
 (hunchentoot:define-easy-handler (api-redefine :uri "/api/redefine") (name body)
   (check-api-auth)
+  (check-csrf)
   (setf (hunchentoot:content-type*) "text/plain")
   (handler-case
       (progn
@@ -385,6 +506,8 @@ output that could exhaust memory while printing."
                (*read-eval* nil)
                (body-form (read-from-string body)))
           (safe-sandbox:redefine-function name body-form)
+          (log-event "evaluations.log" "REDEFINE ip=~a name=~a"
+                     (sanitize-log (client-ip) 64) (sanitize-log name 64))
           (format nil "Function '~a' defined successfully." name)))
     (storage-condition () "Error: Resource limit exceeded!")
     (serious-condition (c) (format nil "Error: ~a" c))))
@@ -400,11 +523,14 @@ output that could exhaust memory while printing."
   (setf hunchentoot:*session-secret* *session-secret*)
   ;; Never put the session id in URLs (it would leak via Referer/logs/history).
   (setf hunchentoot:*rewrite-for-session-urls* nil)
-  (setf *acceptor* (make-instance 'hunchentoot:easy-acceptor
+  ;; Never echo Lisp errors/backtraces to clients (information disclosure).
+  (setf hunchentoot:*show-lisp-errors-p* nil
+        hunchentoot:*show-lisp-backtraces-p* nil)
+  (setf *acceptor* (make-instance 'lisp-acceptor
                                   :address *bind-address*
                                   :port *port*
-                                  :access-log-destination "/home/micu/lisp/lisp-app/logs/access.log"
-                                  :message-log-destination "/home/micu/lisp/lisp-app/logs/message.log"))
+                                  :access-log-destination (log-path "access.log")
+                                  :message-log-destination (log-path "message.log")))
   (hunchentoot:start *acceptor*)
   (format t "Server started on ~a:~a~%" *bind-address* *port*))
 
